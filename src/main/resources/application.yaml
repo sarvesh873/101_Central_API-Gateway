@@ -1,0 +1,86 @@
+server:
+  port: 8081
+  http2:
+    enabled: true
+  shutdown: graceful
+
+spring:
+  application:
+    name: api-gateway
+  threads:
+    virtual:
+      enabled: true
+
+  data:
+    redis:
+      host: localhost
+      port: 6379
+
+  cloud:
+    gateway:
+      # =========================================================
+      # GLOBAL FILTERS (Applied to EVERY route)
+      # =========================================================
+      default-filters:
+        - DedupeResponseHeader=Access-Control-Allow-Credentials Access-Control-Allow-Origin
+        - name: Retry
+          args:
+            retries: 3
+            methods: GET,POST
+            backoff:
+              firstBackoff: 50ms
+              maxBackoff: 500ms
+        - name: CircuitBreaker
+          args:
+            name: apiGatewayCircuitBreaker
+            fallbackUri: forward:/fallback/global
+        - name: RequestRateLimiter
+          args:
+            redis-rate-limiter.replenishRate: 10
+            redis-rate-limiter.burstCapacity: 20
+
+      # =========================================================
+      # CORS CONFIGURATION
+      # =========================================================
+      globalcors:
+        cors-configurations:
+          '[/**]':
+            allowedOrigins: "*"
+            allowedMethods: "GET,POST,PUT,DELETE,PATCH,OPTIONS"
+            allowedHeaders: "*"
+            allowCredentials: false
+
+      # =========================================================
+      # SERVICE ROUTES
+      # =========================================================
+      routes:
+        - id: authentication-service
+          uri: http://localhost:8083
+          predicates:
+            - Path=/api/auth/**
+          # No AuthFilter here (this is the login path!)
+
+        - id: transaction-service
+          uri: http://localhost:9090
+          predicates:
+            - Path=/api/transactions/**
+          filters:
+            - AuthenticationFilter # Custom Logic below
+            - name: RequestRateLimiter
+              args:
+                redis-rate-limiter.replenishRate: 5 # Stricter for payments
+
+        - id: wallet-service
+          uri: http://localhost:9095
+          predicates:
+            - Path=/api/wallets/**
+          filters:
+            - AuthenticationFilter
+
+resilience4j:
+  circuitbreaker:
+    instances:
+      apiGatewayCircuitBreaker:
+        slidingWindowSize: 20
+        failureRateThreshold: 50
+        waitDurationInOpenState: 15s

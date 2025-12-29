@@ -3,7 +3,6 @@ server:
   http2:
     enabled: true
   shutdown: graceful
-
 spring:
   application:
     name: api-gateway
@@ -18,6 +17,11 @@ spring:
 
   cloud:
     gateway:
+      httpclient:
+        response-timeout: 45000
+        connect-timeout: 5000
+        ssl:
+          use-insecure-trust-manager: true
       # =========================================================
       # GLOBAL FILTERS (Applied to EVERY route)
       # =========================================================
@@ -27,17 +31,21 @@ spring:
           args:
             retries: 3
             methods: GET,POST
+            statuses: SERVICE_UNAVAILABLE
+            # EXPONENTIAL BACKOFF: Prevents DDoS
             backoff:
-              firstBackoff: 50ms
-              maxBackoff: 500ms
+              firstBackoff: 10000ms  # Wait 10s before 1st retry
+              maxBackoff: 20000ms    # Max wait
+              factor: 1              # Constant delay
         - name: CircuitBreaker
           args:
             name: apiGatewayCircuitBreaker
-            fallbackUri: forward:/fallback/global
+            fallbackUri: forward:/fallback
         - name: RequestRateLimiter
           args:
             redis-rate-limiter.replenishRate: 10
             redis-rate-limiter.burstCapacity: 20
+            redis-rate-limiter.requestedTokens: 2
 
       # =========================================================
       # CORS CONFIGURATION
@@ -57,11 +65,12 @@ spring:
         - id: authentication-service
           uri: http://localhost:8083
           predicates:
-            - Path=/api/auth/**
-          # No AuthFilter here (this is the login path!)
+            - Path=/api/auth/**, /api/user/**
+          filters:
+            - RewritePath=/api/(?<segment>.*), /authentication_service/api/${segment}
 
         - id: transaction-service
-          uri: http://localhost:9090
+          uri: http://localhost:8080
           predicates:
             - Path=/api/transactions/**
           filters:
@@ -69,18 +78,66 @@ spring:
             - name: RequestRateLimiter
               args:
                 redis-rate-limiter.replenishRate: 5 # Stricter for payments
+            - RewritePath=/api/(?<segment>.*), /transaction_service/api/${segment}
 
         - id: wallet-service
-          uri: http://localhost:9095
+          uri: http://localhost:8085
           predicates:
             - Path=/api/wallets/**
           filters:
             - AuthenticationFilter
+            - RewritePath=/api/(?<segment>.*), /wallet_service/api/${segment}
+
+        - id : reward-service
+          uri: http://localhost:8086
+          predicates:
+            - Path=/reward_service/api/**
+
+
 
 resilience4j:
   circuitbreaker:
     instances:
       apiGatewayCircuitBreaker:
-        slidingWindowSize: 20
-        failureRateThreshold: 50
-        waitDurationInOpenState: 15s
+        registerHealthIndicator: true
+        event-consumer-buffer-size: 10
+        automatic-transition-from-open-to-half-open-enabled: true
+        failure-rate-threshold: 50
+        minimum-number-of-calls: 5
+        permitted-number-of-calls-in-half-open-state: 3
+        sliding-window-size: 10
+        wait-duration-in-open-state: 5s
+        sliding-window-type: COUNT_BASED
+
+logging:
+  level:
+    root: INFO
+    com.central.api_gateway: DEBUG
+    org.springframework.core.io: TRACE
+    org.springframework.core.io.support: TRACE
+    org.springframework.cloud.gateway: DEBUG
+    org.springframework.security: DEBUG
+    reactor.netty: DEBUG
+    reactor.ipc: DEBUG
+  pattern:
+    console: "%d{yyyy-MM-dd HH:mm:ss} [%thread] %-5level %logger{36} - %msg%n"
+
+jwt:
+  secret: U2VjdXJlU2VjcmV0S2V5Rm9ySldUVG9rZW5HZW5lcmF0aW9uMTIzNDU2Nw==
+
+
+management:
+  endpoints:
+    web:
+      exposure:
+        # Added health, info, metrics, and circuitbreakers
+        include: health, info, metrics, prometheus, circuitbreakers
+  health:
+    circuitbreakers:
+      enabled: true # ENABLED: Allows /actuator/health to show circuit state
+  endpoint:
+    health:
+      show-details: always
+  tracing:
+    sampling:
+      probability: '1.0'
